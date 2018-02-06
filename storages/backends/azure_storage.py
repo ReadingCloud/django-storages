@@ -45,8 +45,7 @@ class AzureStorage(Storage):
     @property
     def connection(self):
         if self._connection is None:
-            self._connection = BlobService(
-                self.account_name, self.account_key)
+            self._connection = BlobService(account_name=self.account_name, account_key=self.account_key, endpoint_suffix="core.chinacloudapi.cn")
         return self._connection
 
     @property
