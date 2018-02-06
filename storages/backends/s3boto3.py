@@ -1,6 +1,7 @@
+import mimetypes
 import os
 import posixpath
-import mimetypes
+import threading
 from gzip import GzipFile
 from tempfile import SpooledTemporaryFile
 
@@ -8,10 +9,14 @@ from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.utils.deconstruct import deconstructible
-from django.utils.encoding import force_text, smart_str, filepath_to_uri, force_bytes
-from django.utils.six.moves.urllib import parse as urlparse
+from django.utils.encoding import (
+    filepath_to_uri, force_bytes, force_text, smart_text,
+)
 from django.utils.six import BytesIO
-from django.utils.timezone import localtime, is_naive
+from django.utils.six.moves.urllib import parse as urlparse
+from django.utils.timezone import is_naive, localtime
+
+from storages.utils import safe_join, setting
 
 try:
     import boto3.session
@@ -22,46 +27,12 @@ except ImportError:
     raise ImproperlyConfigured("Could not load Boto3's S3 bindings.\n"
                                "See https://github.com/boto/boto3")
 
-from storages.utils import setting
 
 boto3_version_info = tuple([int(i) for i in boto3_version.split('.')])
 
 if boto3_version_info[:2] < (1, 2):
     raise ImproperlyConfigured("The installed Boto3 library must be 1.2.0 or "
                                "higher.\nSee https://github.com/boto/boto3")
-
-
-def safe_join(base, *paths):
-    """
-    A version of django.utils._os.safe_join for S3 paths.
-
-    Joins one or more path components to the base path component
-    intelligently. Returns a normalized version of the final path.
-
-    The final path must be located inside of the base path component
-    (otherwise a ValueError is raised).
-
-    Paths outside the base path indicate a possible security
-    sensitive operation.
-    """
-    base_path = force_text(base)
-    base_path = base_path.rstrip('/')
-    paths = [force_text(p) for p in paths]
-
-    final_path = base_path
-    for path in paths:
-        final_path = urlparse.urljoin(final_path.rstrip('/') + "/", path)
-
-    # Ensure final_path starts with base_path and that the next character after
-    # the final path is '/' (or nothing, in which case final_path must be
-    # equal to base_path).
-    base_path_len = len(base_path)
-    if (not final_path.startswith(base_path) or
-            final_path[base_path_len:base_path_len + 1] not in ('', '/')):
-        raise ValueError('the joined path is located outside of the base path'
-                         ' component')
-
-    return final_path.lstrip('/')
 
 
 @deconstructible
@@ -199,16 +170,14 @@ class S3Boto3Storage(Storage):
     mode and supports streaming(buffering) data in chunks to S3
     when writing.
     """
-    connection_service_name = 's3'
     default_content_type = 'application/octet-stream'
-    connection_response_error = ClientError
-    file_class = S3Boto3StorageFile
     # If config provided in init, signature_version and addressing_style settings/args are ignored.
     config = None
 
     # used for looking up the access and secret key from env vars
     access_key_names = ['AWS_S3_ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID']
     secret_key_names = ['AWS_S3_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY']
+    security_token_names = ['AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN']
 
     access_key = setting('AWS_S3_ACCESS_KEY_ID', setting('AWS_ACCESS_KEY_ID'))
     secret_key = setting('AWS_S3_SECRET_ACCESS_KEY', setting('AWS_SECRET_ACCESS_KEY'))
@@ -268,10 +237,12 @@ class S3Boto3Storage(Storage):
 
         self._entries = {}
         self._bucket = None
-        self._connection = None
+        self._connections = threading.local()
 
+        self.security_token = None
         if not self.access_key and not self.secret_key:
             self.access_key, self.secret_key = self._get_access_keys()
+            self.security_token = self._get_security_token()
 
         if not self.config:
             self.config = Config(s3={'addressing_style': self.addressing_style},
@@ -283,18 +254,20 @@ class S3Boto3Storage(Storage):
         # Note that proxies are handled by environment variables that the underlying
         # urllib/requests libraries read. See https://github.com/boto/boto3/issues/338
         # and http://docs.python-requests.org/en/latest/user/advanced/#proxies
-        if self._connection is None:
+        connection = getattr(self._connections, 'connection', None)
+        if connection is None:
             session = boto3.session.Session()
-            self._connection = session.resource(
-                self.connection_service_name,
+            self._connections.connection = session.resource(
+                's3',
                 aws_access_key_id=self.access_key,
                 aws_secret_access_key=self.secret_key,
+                aws_session_token=self.security_token,
                 region_name=self.region_name,
                 use_ssl=self.use_ssl,
                 endpoint_url=self.endpoint_url,
                 config=self.config
             )
-        return self._connection
+        return self._connections.connection
 
     @property
     def bucket(self):
@@ -312,9 +285,17 @@ class S3Boto3Storage(Storage):
         Get the locally cached files for the bucket.
         """
         if self.preload_metadata and not self._entries:
-            self._entries = dict((self._decode_name(entry.key), entry)
-                                 for entry in self.bucket.objects.filter(Prefix=self.location))
+            self._entries = {
+                self._decode_name(entry.key): entry
+                for entry in self.bucket.objects.filter(Prefix=self.location)
+            }
         return self._entries
+
+    def _lookup_env(self, names):
+        for name in names:
+            value = os.environ.get(name)
+            if value:
+                return value
 
     def _get_access_keys(self):
         """
@@ -322,14 +303,13 @@ class S3Boto3Storage(Storage):
         are provided to the class in the constructor or in the
         settings then get them from the environment variables.
         """
-        def lookup_env(names):
-            for name in names:
-                value = os.environ.get(name)
-                if value:
-                    return value
-        access_key = self.access_key or lookup_env(self.access_key_names)
-        secret_key = self.secret_key or lookup_env(self.secret_key_names)
+        access_key = self.access_key or self._lookup_env(self.access_key_names)
+        secret_key = self.secret_key or self._lookup_env(self.secret_key_names)
         return access_key, secret_key
+
+    def _get_security_token(self):
+        security_token = self._lookup_env(self.security_token_names)
+        return security_token
 
     def _get_or_create_bucket(self, name):
         """
@@ -341,7 +321,7 @@ class S3Boto3Storage(Storage):
                 # Directly call head_bucket instead of bucket.load() because head_bucket()
                 # fails on wrong region, while bucket.load() does not.
                 bucket.meta.client.head_bucket(Bucket=name)
-            except self.connection_response_error as err:
+            except ClientError as err:
                 if err.response['ResponseMetadata']['HTTPStatusCode'] == 301:
                     raise ImproperlyConfigured("Bucket %s exists, but in a different "
                                                "region than we are connecting to. Set "
@@ -365,7 +345,7 @@ class S3Boto3Storage(Storage):
                     if region_name != 'us-east-1':
                         bucket_params['CreateBucketConfiguration'] = {
                             'LocationConstraint': region_name}
-                    bucket.create(ACL=self.bucket_acl)
+                    bucket.create(**bucket_params)
                 else:
                     raise ImproperlyConfigured("Bucket %s does not exist. Buckets "
                                                "can be automatically created by "
@@ -384,9 +364,8 @@ class S3Boto3Storage(Storage):
         # a workaround here.
         if name.endswith('/') and not clean_name.endswith('/'):
             # Add a trailing slash as it was stripped.
-            return clean_name + '/'
-        else:
-            return clean_name
+            clean_name += '/'
+        return clean_name
 
     def _normalize_name(self, name):
         """
@@ -401,15 +380,20 @@ class S3Boto3Storage(Storage):
                                       name)
 
     def _encode_name(self, name):
-        return smart_str(name, encoding=self.file_name_charset)
+        return smart_text(name, encoding=self.file_name_charset)
 
     def _decode_name(self, name):
         return force_text(name, encoding=self.file_name_charset)
 
     def _compress_content(self, content):
         """Gzip a given string content."""
+        content.seek(0)
         zbuf = BytesIO()
-        zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf)
+        #  The GZIP header has a modification time attribute (see http://www.zlib.org/rfc-gzip.html)
+        #  This means each time a file is compressed it changes even if the other contents don't change
+        #  For S3 this defeats detection of changes using MD5 sums on gzipped files
+        #  Fixing the mtime at 0.0 at compression time avoids this problem
+        zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf, mtime=0.0)
         try:
             zfile.write(force_bytes(content.read()))
         finally:
@@ -423,8 +407,8 @@ class S3Boto3Storage(Storage):
     def _open(self, name, mode='rb'):
         name = self._normalize_name(self._clean_name(name))
         try:
-            f = self.file_class(name, mode, self)
-        except self.connection_response_error as err:
+            f = S3Boto3StorageFile(name, mode, self)
+        except ClientError as err:
             if err.response['ResponseMetadata']['HTTPStatusCode'] == 404:
                 raise IOError('File does not exist: %s' % name)
             raise  # Let it bubble up if it was some other error
@@ -434,8 +418,9 @@ class S3Boto3Storage(Storage):
         cleaned_name = self._clean_name(name)
         name = self._normalize_name(cleaned_name)
         parameters = self.object_parameters.copy()
+        _type, encoding = mimetypes.guess_type(name)
         content_type = getattr(content, 'content_type',
-                               mimetypes.guess_type(name)[0] or self.default_content_type)
+                               _type or self.default_content_type)
 
         # setting the content_type in the key object is not enough.
         parameters.update({'ContentType': content_type})
@@ -443,11 +428,26 @@ class S3Boto3Storage(Storage):
         if self.gzip and content_type in self.gzip_content_types:
             content = self._compress_content(content)
             parameters.update({'ContentEncoding': 'gzip'})
+        elif encoding:
+            # If the content already has a particular encoding, set it
+            parameters.update({'ContentEncoding': encoding})
 
         encoded_name = self._encode_name(name)
         obj = self.bucket.Object(encoded_name)
         if self.preload_metadata:
             self._entries[encoded_name] = obj
+
+        # If both `name` and `content.name` are empty or None, your request
+        # can be rejected with `XAmzContentSHA256Mismatch` error, because in
+        # `django.core.files.storage.Storage.save` method your file-like object
+        # will be wrapped in `django.core.files.File` if no `chunks` method
+        # provided. `File.__bool__`  method is Django-specific and depends on
+        # file name, for this reason`botocore.handlers.calculate_md5` can fail
+        # even if wrapped file-like object exists. To avoid Django-specific
+        # logic, pass internal file-like object if `content` is `File`
+        # class instance.
+        if isinstance(content, File):
+            content = content.file
 
         self._save_content(obj, content, parameters=parameters)
         # Note: In boto3, after a put, last_modified is automatically reloaded
@@ -471,20 +471,13 @@ class S3Boto3Storage(Storage):
         self.bucket.Object(self._encode_name(name)).delete()
 
     def exists(self, name):
-        if not name:
-            try:
-                self.bucket
-                return True
-            except ImproperlyConfigured:
-                return False
         name = self._normalize_name(self._clean_name(name))
         if self.entries:
             return name in self.entries
-        obj = self.bucket.Object(self._encode_name(name))
         try:
-            obj.load()
+            self.connection.meta.client.head_object(Bucket=self.bucket_name, Key=name)
             return True
-        except self.connection_response_error:
+        except ClientError:
             return False
 
     def listdir(self, name):
@@ -513,7 +506,7 @@ class S3Boto3Storage(Storage):
         if self.entries:
             entry = self.entries.get(name)
             if entry:
-                return entry.content_length
+                return entry.size if hasattr(entry, 'size') else entry.content_length
             return 0
         return self.bucket.Object(self._encode_name(name)).content_length
 
@@ -550,9 +543,11 @@ class S3Boto3Storage(Storage):
         # from v2 and v4 signatures, regardless of the actual signature version used.
         split_url = urlparse.urlsplit(url)
         qs = urlparse.parse_qsl(split_url.query, keep_blank_values=True)
-        blacklist = set(['x-amz-algorithm', 'x-amz-credential', 'x-amz-date',
-                         'x-amz-expires', 'x-amz-signedheaders', 'x-amz-signature',
-                         'x-amz-security-token', 'awsaccesskeyid', 'expires', 'signature'])
+        blacklist = {
+            'x-amz-algorithm', 'x-amz-credential', 'x-amz-date',
+            'x-amz-expires', 'x-amz-signedheaders', 'x-amz-signature',
+            'x-amz-security-token', 'awsaccesskeyid', 'expires', 'signature',
+        }
         filtered_qs = ((key, val) for key, val in qs if key.lower() not in blacklist)
         # Note: Parameters that did not have a value in the original query string will have
         # an '=' sign appended to it, e.g ?foo&bar becomes ?foo=&bar=
